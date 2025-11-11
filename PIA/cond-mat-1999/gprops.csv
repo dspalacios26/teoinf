@@ -1,0 +1,7 @@
+# prop_name, value
+name,arxiv_collab (cond-mat-1999)
+description,"Collaboration graphs for scientists, extracted from the Los Alamos e-Print arXiv (physics), for 1995-1999 for three categories, and additionally for 1995-2003 and 1995-2005 for one category. For copyright reasons, the MEDLINE (biomedical research) and NCSTRL (computer science) collaboration graphs from this paper are not publicly available."
+citation,"['M. E. J. Newman, \"The structure of scientific collaboration networks.\" Proc. Natl. Acad. Sci. USA 98(2), 404-409 (2001). arxiv:cond-mat/0007214, http://www.pnas.org/content/98/2/404.abstract']"
+url,http://www-personal.umich.edu/~mejn/netdata/
+tags,"['Social', 'Collaboration', 'Weighted', 'Projection']"
+directed,0.0
