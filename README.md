@@ -75,3 +75,29 @@ python -m pytest
 2. Iteratively call the MWU-based matching routine: temporal weights down-weight edges that already appear in previous matchings, and the oracle (Edmonds' blossom) returns the current best candidate.
 3. Collect \(k\) distinct matchings while maximising the minimum weighted symmetric-difference distance between every pair.
 4. Report the resulting collection and the quality metrics.
+
+## Requirements and installation (for VSCode)
+From the project folder (/path/to/teoinf-main/PIA):
+
+## Create and activate environment
+Linux/macOS:
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+
+Windows (PowerShell):
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+
+Install dependencies (add numpy because the optimized code uses it):
+pip install -r requirements.txt
+pip install numpy
+
+## How to run
+Quick test with the small included dataset (small_test) to verify:
+python -m src.diverse_matching small_test -k 2 -r 3 --delta 0.2 --seed 1 --approx greedy
+
+Run in fast mode (recommended first) — use greedy (much faster, reads all the same):
+python -m src.diverse_matching astro-ph-1999 -k 5 -r 20 --delta 0.2 --seed 42 --approx greedy
+
