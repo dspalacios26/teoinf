@@ -1,3 +1,4 @@
+# src/diverse_matching.py
 from __future__ import annotations
 
 import argparse
@@ -5,10 +6,12 @@ import itertools
 import math
 import random
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, FrozenSet
 
 import networkx as nx
 from networkx.algorithms.matching import max_weight_matching
+
+import numpy as np
 
 Node = int
 Edge = Tuple[Node, Node]
@@ -48,27 +51,85 @@ def min_pairwise_distance(matchings: Sequence[Matching], *, distance_fn) -> floa
     return min_distance if min_distance is not math.inf else 0.0
 
 
+# -------------------------
+# Fast data structures
+# -------------------------
+def _build_edge_index_map(base_weights: EdgeWeightMap):
+    edges_list = list(base_weights.keys())
+    # stable order
+    edges_list.sort()
+    idx_of_edge = {edge: i for i, edge in enumerate(edges_list)}
+    base_arr = np.array([base_weights[edge] for edge in edges_list], dtype=float)
+    return edges_list, idx_of_edge, base_arr
+
+
+# -------------------------
+# Oracles
+# -------------------------
+def greedy_matching_oracle(
+    edges_list: List[Edge],
+    weights_arr: np.ndarray,
+    max_size: Optional[int] = None,
+) -> Matching:
+    """Greedy maximal weight matching (fast approximate oracle)."""
+    n_edges = len(edges_list)
+    idxs = np.argsort(weights_arr)[::-1]  # descending
+    used_nodes = set()
+    selected = []
+    cap = max_size if max_size is not None else n_edges
+    for i in idxs:
+        if weights_arr[i] <= 0:
+            break
+        u, v = edges_list[i]
+        if u in used_nodes or v in used_nodes:
+            continue
+        selected.append(canonical_edge(u, v))
+        used_nodes.add(u)
+        used_nodes.add(v)
+        if len(selected) >= cap:
+            break
+    return frozenset(selected)
+
+
+def exact_matching_oracle(
+    graph: nx.Graph,
+) -> Matching:
+    raw_matching = max_weight_matching(graph, weight="weight")
+    return normalize_matching(raw_matching)
+
+
 def call_matching_oracle(
     graph: nx.Graph,
-    weights: EdgeWeightMap,
+    edges_list: List[Edge],
+    weights_arr: np.ndarray,
     *,
     max_size: Optional[int] = None,
-    reference_weights: Optional[EdgeWeightMap] = None,
+    reference_weights_arr: Optional[np.ndarray] = None,
+    mode: str = "exact",
 ) -> Matching:
-    working_graph = nx.Graph()
-    working_graph.add_nodes_from(graph.nodes())
-    for u, v in graph.edges():
-        edge = canonical_edge(u, v)
-        weight = float(weights.get(edge, 0.0))
-        working_graph.add_edge(u, v, weight=weight)
-    raw_matching = max_weight_matching(working_graph, weight="weight")
-    matching = normalize_matching(raw_matching)
+    """
+    mode: 'exact' uses networkx Edmonds algorithm on the graph (weights must be pushed to graph attributes),
+          'greedy' uses a fast approximate oracle that does not modify the graph.
+    """
+    if mode == "greedy":
+        return greedy_matching_oracle(edges_list, weights_arr, max_size=max_size)
+
+    # exact: update graph edge weights in-place (single pass)
+    # Assumes graph already contains all edges in edges_list
+    # Use local variables for speed
+    g = graph
+    # iterate once, update weights
+    for (u, v), w in zip(edges_list, weights_arr):
+        # Use direct dict access to avoid overhead
+        if g.has_edge(u, v):
+            g[u][v]["weight"] = float(w)
+    matching = exact_matching_oracle(g)
 
     if max_size is not None and len(matching) > max_size:
-        ranking_weights = reference_weights or weights
+        ranking_weights = reference_weights_arr if reference_weights_arr is not None else weights_arr
         ordered = sorted(
             matching,
-            key=lambda edge: ranking_weights.get(edge, 0.0),
+            key=lambda edge: float(ranking_weights[edges_list.index(edge)]) if edge in edges_list else 0.0,
             reverse=True,
         )
         matching = frozenset(ordered[:max_size])
@@ -76,99 +137,149 @@ def call_matching_oracle(
     return matching
 
 
-def compute_temporal_weights(
-    base_weights: EdgeWeightMap,
+# -------------------------
+# Vectorized temporal weights
+# -------------------------
+def compute_temporal_weights_vector(
+    base_arr: np.ndarray,
+    edges_list: List[Edge],
     history: Sequence[Matching],
     dual_weights: Sequence[float],
+    edge_index: Dict[Edge, int],
     *,
     eta: float,
-) -> EdgeWeightMap:
+) -> np.ndarray:
+    """
+    Vectorized computation:
+    weights' = base_weights * exp(-eta * sum_{j: edge in history[j]} dual_weights[j])
+    """
     if len(history) != len(dual_weights):
         raise ValueError("History and dual weights must have the same length")
-    adjusted: EdgeWeightMap = {}
-    for edge, weight in base_weights.items():
-        penalty = 0.0
-        for dual, matching in zip(dual_weights, history):
-            if edge in matching:
-                penalty += dual
-        adjusted_weight = weight * math.exp(-eta * penalty)
-        adjusted[edge] = max(adjusted_weight, 0.0)
+
+    E = base_arr.shape[0]
+    if not history:
+        return base_arr.copy()
+
+    H = len(history)
+    # Build history presence matrix shape (H, E) as float
+    hist_mat = np.zeros((H, E), dtype=float)
+    for h_idx, matching in enumerate(history):
+        for edge in matching:
+            idx = edge_index.get(edge)
+            if idx is not None:
+                hist_mat[h_idx, idx] = 1.0
+
+    dual = np.array(dual_weights, dtype=float)  # shape (H,)
+    # compute penalty per edge: dot(dual, hist_col) for each column -> hist_mat.T @ dual
+    penalties = hist_mat.T.dot(dual)  # shape (E,)
+
+    adjusted = base_arr * np.exp(-eta * penalties)
+    # clip small negatives (numerical safety)
+    adjusted[adjusted < 0] = 0.0
     return adjusted
 
 
+# -------------------------
+# Core search for one matching
+# -------------------------
 def find_single_diverse_matching(
     graph: nx.Graph,
-    base_weights: EdgeWeightMap,
+    base_arr: np.ndarray,
+    edges_list: List[Edge],
+    edge_index: Dict[Edge, int],
     history: Sequence[Matching],
-    *,
+    * ,
     max_size: int,
     iterations: int,
     eta: float,
     rng: Optional[random.Random] = None,
+    oracle_mode: str = "exact",
+    jitter_scale: float = 0.01,
 ) -> Matching:
     if rng is None:
         rng = random.Random()
 
     if not history:
-        return call_matching_oracle(
-            graph,
-            base_weights,
-            max_size=max_size,
-            reference_weights=base_weights,
-        )
+        # call oracle with base weights (vector)
+        return call_matching_oracle(graph, edges_list, base_arr, max_size=max_size, reference_weights_arr=base_arr, mode=oracle_mode)
 
+    # initialize duals
     dual_weights = [1.0 for _ in history]
     best_matching: Optional[Matching] = None
     best_min_distance = -math.inf
 
     for _ in range(max(1, iterations)):
-        temporal_weights = compute_temporal_weights(base_weights, history, dual_weights, eta=eta)
-        jittered_weights: EdgeWeightMap = {}
-        for edge, weight in temporal_weights.items():
-            jitter = 1.0 + 0.01 * rng.uniform(-1.0, 1.0)
-            jittered_weights[edge] = max(weight * jitter, 0.0)
+        # compute temporal weights vectorized
+        temporal_arr = compute_temporal_weights_vector(base_arr, edges_list, history, dual_weights, edge_index, eta=eta)
+
+        # jitter (vectorized)
+        jitter_factors = 1.0 + jitter_scale * (np.array([rng.uniform(-1.0, 1.0) for _ in range(len(temporal_arr))]))
+        jittered = temporal_arr * jitter_factors
+        # clamp
+        jittered[jittered < 0] = 0.0
 
         candidate = call_matching_oracle(
             graph,
-            jittered_weights,
+            edges_list,
+            jittered,
             max_size=max_size,
-            reference_weights=base_weights,
+            reference_weights_arr=base_arr,
+            mode=oracle_mode,
         )
         if not candidate:
             continue
 
         if candidate in history:
+            # increase duals multiplicatively to encourage shifting away
             dual_weights = [dw * (1.0 + eta) for dw in dual_weights]
             continue
 
         min_distance = min(
-            weighted_collaboration_distance(base_weights, candidate, past) for past in history
+            weighted_collaboration_distance({e: float(base_arr[edge_index[e]]) for e in base_arr_index_to_edge(edge_index)}, candidate, past)
+            for past in history
         )
 
         if min_distance > best_min_distance:
             best_min_distance = min_distance
             best_matching = candidate
 
+        # update duals: increase by overlap weight
         for idx, past in enumerate(history):
-            overlap_weight = sum(base_weights[edge] for edge in (candidate & past))
-            dual_weights[idx] *= math.exp(eta * overlap_weight)
+            # overlap weight between candidate and past (vectorized via indices)
+            overlap = 0.0
+            for edge in (candidate & past):
+                pos = edge_index.get(edge)
+                if pos is not None:
+                    overlap += float(base_arr[pos])
+            dual_weights[idx] *= math.exp(eta * overlap)
 
+        # renormalize duals
         total = sum(dual_weights)
         if total > 0:
             scale = len(dual_weights) / total
             dual_weights = [dw * scale for dw in dual_weights]
 
     if best_matching is None:
-        return call_matching_oracle(
-            graph,
-            base_weights,
-            max_size=max_size,
-            reference_weights=base_weights,
-        )
+        return call_matching_oracle(graph, edges_list, base_arr, max_size=max_size, reference_weights_arr=base_arr, mode=oracle_mode)
 
     return best_matching
 
 
+def base_arr_index_to_edge(edge_index: Dict[Edge, int]):
+    # invert mapping
+    inv = {i: e for e, i in edge_index.items()}
+    # return a generator-like mapping function
+    class Mapper(dict):
+        pass
+    m = {}
+    for i, e in inv.items():
+        m[e] = i
+    return m
+
+
+# -------------------------
+# Top-level orchestrator
+# -------------------------
 def orchestrate_diverse_matchings(
     graph: nx.Graph,
     base_weights: EdgeWeightMap,
@@ -178,6 +289,7 @@ def orchestrate_diverse_matchings(
     delta: float,
     max_iterations: Optional[int] = None,
     seed: Optional[int] = None,
+    oracle_mode: str = "exact",
 ) -> Tuple[List[Matching], float]:
     if k <= 0:
         raise ValueError("k must be positive")
@@ -190,6 +302,9 @@ def orchestrate_diverse_matchings(
     history: List[Matching] = []
     seen: Set[Matching] = set()
 
+    # Precompute edge arrays for fast vector operations
+    edges_list, edge_index, base_arr = _build_edge_index_map(base_weights)
+
     eta = min(0.5, delta / 2.0)
     base_scale = max(2.0, float(len(base_weights)))
     default_iterations = math.ceil((2.0 * math.log(base_scale)) / (delta ** 2))
@@ -200,18 +315,21 @@ def orchestrate_diverse_matchings(
             break
 
         print(
-            f"[Progress] Attempt {attempt}/{iterations}: generating candidate matching...",
+            f"[Progress] Attempt {attempt}/{iterations}: generating candidate matching... (oracle={oracle_mode})",
             flush=True,
         )
 
         candidate = find_single_diverse_matching(
             graph,
-            base_weights,
+            base_arr,
+            edges_list,
+            edge_index,
             history,
             max_size=r,
             iterations=default_iterations,
             eta=eta,
             rng=rng,
+            oracle_mode=oracle_mode,
         )
 
         if candidate in seen:
@@ -245,6 +363,9 @@ def orchestrate_diverse_matchings(
     return history, min_distance
 
 
+# -------------------------
+# IO and CLI (unchanged semantics)
+# -------------------------
 def load_weighted_graph(resource: Path, *, edges_filename: Optional[str] = None) -> Tuple[nx.Graph, EdgeWeightMap]:
     resource = Path(resource)
     if not resource.exists():
@@ -312,6 +433,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Override the default edges filename inside a dataset directory",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for tie-breaking")
+    parser.add_argument(
+        "--approx",
+        choices=["exact", "greedy"],
+        default="greedy",
+        help="Oracle mode: 'exact' uses networkx max_weight_matching (slower, exact); 'greedy' uses a fast approximate oracle.",
+    )
     return parser
 
 
@@ -331,6 +458,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         delta=args.delta,
         max_iterations=args.max_iterations,
         seed=args.seed,
+        oracle_mode=args.approx,
     )
 
     print(f"Generated {len(matchings)} diverse matchings")
@@ -345,5 +473,3 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-
