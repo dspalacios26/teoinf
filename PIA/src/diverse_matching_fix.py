@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 import networkx as nx
-from tqdm import tqdm
 
 # ==== Tipos ====
 Edge = Tuple[int, int]
@@ -13,7 +12,7 @@ Matching = FrozenSet[Edge]
 EdgeWeightMap = Dict[Edge, float]
 
 
-# ==== Utilidades básicas (definidas aquí para no depender de otros módulos) ====
+# ==== Utilidades básicas ====
 def canonical_edge(u: int, v: int) -> Edge:
     return (u, v) if u <= v else (v, u)
 
@@ -34,7 +33,7 @@ def fast_max_weight_matching(graph: nx.Graph) -> Matching:
     return normalize_matching(raw)
 
 
-# ==== Algoritmo principal, versión optimizada ====
+# ==== Algoritmo principal, salida estilo 'primera imagen' ====
 def orchestrate_diverse_matchings(
     graph: nx.Graph,
     weights: EdgeWeightMap,
@@ -44,6 +43,7 @@ def orchestrate_diverse_matchings(
     max_iterations: int = 300,
     seed: int = 1,
 ) -> Tuple[List[Matching], int]:
+
     random.seed(seed)
 
     all_edges = [canonical_edge(u, v) for u, v in graph.edges()]
@@ -54,17 +54,21 @@ def orchestrate_diverse_matchings(
 
     eta = max(1e-3, min(0.5, delta))
 
-    pbar = tqdm(range(1, max_iterations + 1), desc="FIXED", ncols=100)
+    print()
+    print("============================================================")
+    print("             Running Diverse Matchings (FIXED)              ")
+    print("============================================================")
+    print()
 
-    for it in pbar:
-        # 1) Actualiza pesos efectivos en el grafo
+    for it in range(1, max_iterations + 1):
+        print(f"[Progress] Attempt {it}/{max_iterations}: generating candidate matching...")
+
+        # 1) Actualiza pesos efectivos
         for u, v in graph.edges():
             e = canonical_edge(u, v)
             graph[u][v]["weight"] = weights[e] * dual[e]
 
-        # 2) Matching:
-        #    - primeras iteraciones: exacto (max_weight_matching)
-        #    - después: maximal_matching (mucho más rápido)
+        # 2) Matching (exacto primeras iteraciones)
         if it <= 5:
             M = fast_max_weight_matching(graph)
         else:
@@ -74,20 +78,21 @@ def orchestrate_diverse_matchings(
         if not M:
             continue
 
-        # 3) Recorta a lo más r aristas por matching
+        # 3) Recortar a r aristas
         if len(M) > r:
-            M = frozenset(
-                sorted(M, key=lambda e: weights[e], reverse=True)[:r]
-            )
+            M = frozenset(sorted(M, key=lambda e: weights[e], reverse=True)[:r])
 
-        # 4) Guarda si es nuevo
+        # 4) Registrar si es nuevo
         if M not in seen:
+            idx = len(selected) + 1
             selected.append(M)
             seen.add(M)
+            print(f"[Progress] Selected matching {idx}/{k} (|M|={len(M)})")
+
             if len(selected) >= k:
                 break
 
-        # 5) Actualiza variables duales
+        # 5) Actualiza duales
         used = set(M)
         for e in all_edges:
             if e in used:
@@ -95,20 +100,19 @@ def orchestrate_diverse_matchings(
             else:
                 dual[e] *= (1 + eta)
 
-        # 6) Normalización para evitar overflow/underflow
+        # 6) Normalización
         avg = sum(dual.values()) / len(dual)
-        inv_avg = 1.0 / avg
+        inv = 1.0 / avg
         for e in dual:
-            dual[e] *= inv_avg
+            dual[e] *= inv
 
-    pbar.close()
     return selected, len(selected)
 
 
-# ==== Carga de dataset (igual que en tu versión original) ====
+# ==== Carga de dataset ====
 def load_dataset(path: Path) -> Tuple[nx.Graph, EdgeWeightMap]:
     if path.is_dir():
-        file = path / "edges_small.csv"
+        file = path / "edges.csv"
     else:
         file = path
 
@@ -150,10 +154,19 @@ def main():
         G, w, a.k, a.r, a.delta, a.max_iterations, a.seed
     )
 
-    print("\n[FIXED]")
+    print()
+    print("============================================================")
+    print("                           RESULTS                          ")
+    print("============================================================")
+    print()
+
     for i, M in enumerate(matchings, 1):
         total_w = sum(w[e] for e in M)
-        print(f"M{i}: {len(M)} edges, total weight={total_w:.2f}")
+        print(f"Matching #{i} (|M|={len(M)})")
+        for u, v in M:
+            print(f"  {u} ↔ {v}  (weight={w[(u,v)]:.4f})")
+        print(f"Total weight = {total_w:.4f}")
+        print("------------------------------------------------------------")
 
 
 if __name__ == "__main__":
