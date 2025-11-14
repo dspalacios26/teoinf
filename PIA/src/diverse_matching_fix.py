@@ -32,7 +32,71 @@ def fast_max_weight_matching(graph: nx.Graph) -> Matching:
     return normalize_matching(raw)
 
 
-# ==== ALGORITMO PRINCIPAL: precisión + diversidad al estilo imágenes 1 y 2 ====
+# ============================================================
+#   NUEVAS FUNCIONES: DISTANCIAS Y VERIFICACIÓN (PAPER)
+# ============================================================
+
+def weighted_hamming_distance(M1: Matching, M2: Matching, weights: EdgeWeightMap) -> float:
+    dist = 0.0
+    all_edges = set(M1) | set(M2)
+    for e in all_edges:
+        if (e in M1) != (e in M2):
+            dist += weights[e]
+    return dist
+
+
+def min_pairwise_distance(matchings: List[Matching], weights: EdgeWeightMap) -> float:
+    if len(matchings) < 2:
+        return 0.0
+    best = float("inf")
+    for i in range(len(matchings)):
+        for j in range(i + 1, len(matchings)):
+            d = weighted_hamming_distance(matchings[i], matchings[j], weights)
+            best = min(best, d)
+    return best
+
+
+def estimate_Psi(graph: nx.Graph, weights: EdgeWeightMap,
+                 k: int, r: int, delta: float,
+                 max_iterations: int, trials: int = 3) -> float:
+    """Estimación empírica del valor Ψ."""
+    best = 0.0
+    import random
+
+    for _ in range(trials):
+        seed = random.randint(1, 10**9)
+        sols, _ = orchestrate_diverse_matchings(
+            graph.copy(), weights, k, r, delta,
+            max_iterations, seed, silent=True
+        )
+        d = min_pairwise_distance(sols, weights)
+        best = max(best, d)
+
+    return best
+
+
+def verify_paper_bound(matchings: List[Matching], weights: EdgeWeightMap,
+                       Psi_estimate: float, delta: float, mu: float = 0.5):
+
+    min_dist = min_pairwise_distance(matchings, weights)
+    rhs = (mu / 2) * Psi_estimate - delta
+
+    print("\n================ PAPER GUARANTEE CHECK ================")
+    print(f"Min pairwise distance: {min_dist:.4f}")
+    print(f"Psi estimate:          {Psi_estimate:.4f}")
+    print(f"(mu/2)*Psi - δ:        {rhs:.4f}")
+
+    if min_dist >= rhs:
+        print("✔ La desigualdad del paper SE CUMPLE.")
+    else:
+        print("✘ La desigualdad del paper NO se cumple.")
+    print("=======================================================\n")
+
+
+# ============================================================
+#      ALGORITMO PRINCIPAL (con SILENT MODE integrado)
+# ============================================================
+
 def orchestrate_diverse_matchings(
     graph: nx.Graph,
     weights: EdgeWeightMap,
@@ -41,6 +105,7 @@ def orchestrate_diverse_matchings(
     delta: float = 0.3,
     max_iterations: int = 300,
     seed: int = 1,
+    silent: bool = False,   # <<<<<<<<<< ADDED
 ) -> Tuple[List[Matching], int]:
 
     random.seed(seed)
@@ -51,52 +116,46 @@ def orchestrate_diverse_matchings(
     selected: List[Matching] = []
     seen: Set[Matching] = set()
 
-    # eta reducido para evitar distorsión
     eta = max(1e-4, min(0.1, delta * 0.1))
 
-    print("\n============================================================")
-    print("             Running Diverse Matchings (FIXED)              ")
-    print("============================================================\n")
+    # Cabecera (solo si NO es silent)
+    if not silent:
+        print("\n============================================================")
+        print("             Running Diverse Matchings (FIXED)              ")
+        print("============================================================\n")
 
-    # ===============================================================
-    #           LOOP PRINCIPAL
-    # ===============================================================
     for it in range(1, max_iterations + 1):
 
-        print(f"[Progress] Attempt {it}/{max_iterations}: generating candidate matching...")
+        if not silent:
+            print(f"[Progress] Attempt {it}/{max_iterations}: generating candidate matching...")
 
-        # 1) Actualizar pesos efectivos = peso * dual + ruido suave
+        # Actualizar pesos con ruido suave
         for u, v in graph.edges():
             e = canonical_edge(u, v)
-
-            # ruido suave proporcional al peso (CLAVE)
             sigma = delta * 0.01
             noise = random.gauss(0, sigma) * weights[e]
-
             graph[u][v]["weight"] = weights[e] * dual[e] + noise
 
-        # 2) Matching SIEMPRE max weight
+        # MATCHING exacto
         M = fast_max_weight_matching(graph)
         if not M:
             continue
 
-        # 3) Recortar si hay más de r aristas
         if len(M) > r:
-            M = frozenset(
-                sorted(M, key=lambda e: weights[e], reverse=True)[:r]
-            )
+            M = frozenset(sorted(M, key=lambda e: weights[e], reverse=True)[:r])
 
-        # 4) Si es nuevo, lo guardamos
         if M not in seen:
             idx = len(selected) + 1
             selected.append(M)
             seen.add(M)
-            print(f"[Progress] Selected matching {idx}/{k} (|M|={len(M)})")
+
+            if not silent:
+                print(f"[Progress] Selected matching {idx}/{k} (|M|={len(M)})")
 
             if len(selected) >= k:
                 break
 
-        # 5) Actualizar duales con penalización SUAVE
+        # Actualización dual
         used = set(M)
         for e in all_edges:
             if e in used:
@@ -104,7 +163,7 @@ def orchestrate_diverse_matchings(
             else:
                 dual[e] *= (1 + eta * 0.25)
 
-        # 6) Normalización
+        # Normalización
         avg = sum(dual.values()) / len(dual)
         inv = 1.0 / avg
         for e in dual:
@@ -113,7 +172,10 @@ def orchestrate_diverse_matchings(
     return selected, len(selected)
 
 
-# ==== Cargar dataset ====
+# ============================================================
+#                CARGA DE DATASET
+# ============================================================
+
 def load_dataset(path: Path) -> Tuple[nx.Graph, EdgeWeightMap]:
     if path.is_dir():
         file = path / "edges.csv"
@@ -146,7 +208,10 @@ def load_dataset(path: Path) -> Tuple[nx.Graph, EdgeWeightMap]:
     return G, w
 
 
-# ==== CLI ====
+# ============================================================
+#                           CLI
+# ============================================================
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("dataset")
@@ -158,8 +223,9 @@ def main():
     a = p.parse_args()
 
     G, w = load_dataset(Path(a.dataset))
+
     matchings, _ = orchestrate_diverse_matchings(
-        G, w, a.k, a.r, a.delta, a.max_iterations, a.seed
+        G, w, a.k, a.r, a.delta, a.max_iterations, a.seed, silent=False
     )
 
     print("\n============================================================")
@@ -170,9 +236,12 @@ def main():
         total_w = sum(w[canonical_edge(u, v)] for u, v in M)
         print(f"Matching #{i} (|M|={len(M)}; total_weight={total_w:.2f})")
         for u, v in M:
-            wt = w[canonical_edge(u, v)]
-            print(f"  {u} — {v}   (weight={wt:.2f})")
+            print(f"  {u} — {v}   (weight={w[canonical_edge(u, v)]:.2f})")
         print("------------------------------------------------------------")
+
+    # === Verificación teórica del paper ===
+    Psi_est = estimate_Psi(G, w, a.k, a.r, a.delta, a.max_iterations, trials=3)
+    verify_paper_bound(matchings, w, Psi_est, a.delta)
 
 
 if __name__ == "__main__":
