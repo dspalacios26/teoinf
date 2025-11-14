@@ -5,7 +5,7 @@ import itertools
 import math
 import random
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple, Callable
 
 import networkx as nx
 from networkx.algorithms.matching import max_weight_matching
@@ -14,6 +14,7 @@ Node = int
 Edge = Tuple[Node, Node]
 Matching = FrozenSet[Edge]
 EdgeWeightMap = Dict[Edge, float]
+MatroidOracle = Callable[[Set[Edge]], bool]
 
 
 def canonical_edge(u: Node, v: Node) -> Edge:
@@ -46,6 +47,260 @@ def min_pairwise_distance(matchings: Sequence[Matching], *, distance_fn) -> floa
         dist = distance_fn(matchings[i], matchings[j])
         min_distance = min(min_distance, dist)
     return min_distance if min_distance is not math.inf else 0.0
+
+
+# ============================================================================
+# Section 2.4.1: Matching Applications
+# ============================================================================
+
+def is_valid_matching(edges: Set[Edge]) -> bool:
+    """
+    Verify that a set of edges forms a valid matching.
+    A valid matching has no two edges sharing a common vertex.
+    
+    Args:
+        edges: Set of edges to verify
+        
+    Returns:
+        True if edges form a valid matching, False otherwise
+    """
+    covered_nodes: Set[Node] = set()
+    for u, v in edges:
+        if u in covered_nodes or v in covered_nodes:
+            return False
+        covered_nodes.add(u)
+        covered_nodes.add(v)
+    return True
+
+
+def matching_matroid_oracle(edges: Set[Edge]) -> bool:
+    """
+    Matroid oracle for the matching matroid.
+    A set of edges is independent iff it forms a valid matching.
+    
+    Args:
+        edges: Set of edges to check
+        
+    Returns:
+        True if edges are independent in the matching matroid
+    """
+    return is_valid_matching(edges)
+
+
+# ============================================================================
+# Section 2.4.2: Matroid Applications
+# ============================================================================
+
+def uniform_matroid_oracle(k: int) -> MatroidOracle:
+    """
+    Create an oracle for a uniform matroid U(k, n).
+    A set is independent iff its size is at most k.
+    
+    Args:
+        k: Maximum size of independent sets
+        
+    Returns:
+        Oracle function that checks independence
+    """
+    def oracle(edges: Set[Edge]) -> bool:
+        return len(edges) <= k
+    return oracle
+
+
+def partition_matroid_oracle(partition: Dict[Edge, int], capacities: Dict[int, int]) -> MatroidOracle:
+    """
+    Create an oracle for a partition matroid.
+    Elements are partitioned into groups, and a set is independent iff
+    it contains at most capacity[i] elements from group i.
+    
+    Args:
+        partition: Maps each edge to its partition group
+        capacities: Maximum number of elements allowed from each group
+        
+    Returns:
+        Oracle function that checks independence
+    """
+    def oracle(edges: Set[Edge]) -> bool:
+        group_counts: Dict[int, int] = {}
+        for edge in edges:
+            group = partition.get(edge, 0)
+            group_counts[group] = group_counts.get(group, 0) + 1
+            if group_counts[group] > capacities.get(group, 0):
+                return False
+        return True
+    return oracle
+
+
+def graphic_matroid_oracle(graph_nodes: Set[Node]) -> MatroidOracle:
+    """
+    Create an oracle for a graphic matroid (forest matroid).
+    A set of edges is independent iff it forms a forest (no cycles).
+    
+    Args:
+        graph_nodes: Set of all nodes in the graph
+        
+    Returns:
+        Oracle function that checks if edges form a forest
+    """
+    def oracle(edges: Set[Edge]) -> bool:
+        if not edges:
+            return True
+        
+        # Build a graph from edges and check for cycles using DFS
+        adj: Dict[Node, List[Node]] = {node: [] for node in graph_nodes}
+        for u, v in edges:
+            adj.setdefault(u, []).append(v)
+            adj.setdefault(v, []).append(u)
+        
+        visited: Set[Node] = set()
+        
+        def has_cycle(node: Node, parent: Optional[Node]) -> bool:
+            visited.add(node)
+            for neighbor in adj.get(node, []):
+                if neighbor not in visited:
+                    if has_cycle(neighbor, node):
+                        return True
+                elif neighbor != parent:
+                    return True
+            return False
+        
+        # Check each connected component
+        for node in adj:
+            if node not in visited:
+                if has_cycle(node, None):
+                    return False
+        
+        return True
+    return oracle
+
+
+def matroid_intersection(
+    ground_set: Set[Edge],
+    oracle1: MatroidOracle,
+    oracle2: MatroidOracle,
+    weights: EdgeWeightMap,
+) -> Tuple[FrozenSet[Edge], float]:
+    """
+    Find maximum weight common independent set of two matroids.
+    Uses a greedy approximation for matroid intersection.
+    
+    Args:
+        ground_set: Set of all edges to consider
+        oracle1: Independence oracle for first matroid
+        oracle2: Independence oracle for second matroid
+        weights: Weight map for edges
+        
+    Returns:
+        Tuple of (common independent set, total weight)
+    """
+    # Greedy approach: sort by weight and add if both oracles accept
+    sorted_edges = sorted(ground_set, key=lambda e: weights.get(e, 0.0), reverse=True)
+    
+    independent_set: Set[Edge] = set()
+    total_weight = 0.0
+    
+    for edge in sorted_edges:
+        candidate = independent_set | {edge}
+        if oracle1(candidate) and oracle2(candidate):
+            independent_set.add(edge)
+            total_weight += weights.get(edge, 0.0)
+    
+    return frozenset(independent_set), total_weight
+
+
+def diverse_matroid_matching(
+    graph: nx.Graph,
+    base_weights: EdgeWeightMap,
+    matroid_oracle: MatroidOracle,
+    k: int,
+    r: int,
+    *,
+    delta: float,
+    max_iterations: Optional[int] = None,
+    seed: Optional[int] = None,
+) -> Tuple[List[Matching], float]:
+    """
+    Generate k diverse matchings subject to an additional matroid constraint.
+    Each matching must satisfy both:
+    1. Be a valid matching (matching matroid)
+    2. Satisfy the given matroid constraint
+    
+    Args:
+        graph: Input graph
+        base_weights: Edge weights
+        matroid_oracle: Additional matroid constraint oracle
+        k: Number of matchings to generate
+        r: Maximum size of each matching
+        delta: Accuracy parameter
+        max_iterations: Optional iteration limit
+        seed: Random seed
+        
+    Returns:
+        Tuple of (list of matchings, minimum pairwise distance)
+    """
+    rng = random.Random(seed)
+    history: List[Matching] = []
+    seen: Set[Matching] = set()
+    
+    eta = min(0.5, delta / 2.0)
+    base_scale = max(2.0, float(len(base_weights)))
+    default_iterations = math.ceil((2.0 * math.log(base_scale)) / (delta ** 2))
+    iterations = max_iterations or (k * default_iterations)
+    
+    for attempt in range(1, iterations + 1):
+        if len(history) >= k:
+            break
+        
+        print(
+            f"[Matroid Progress] Attempt {attempt}/{iterations}: generating candidate...",
+            flush=True,
+        )
+        
+        # Generate candidate matching
+        candidate = find_single_diverse_matching(
+            graph,
+            base_weights,
+            history,
+            max_size=r,
+            iterations=default_iterations,
+            eta=eta,
+            rng=rng,
+        )
+        
+        # Verify matroid constraint
+        if not matroid_oracle(set(candidate)):
+            print(
+                f"[Matroid Progress] Attempt {attempt}: candidate violates matroid constraint",
+                flush=True,
+            )
+            continue
+        
+        if candidate in seen:
+            print(f"[Matroid Progress] Attempt {attempt}: duplicate skipped", flush=True)
+            continue
+        
+        if len(candidate) > r:
+            print(
+                f"[Matroid Progress] Attempt {attempt}: size limit exceeded",
+                flush=True,
+            )
+            continue
+        
+        history.append(candidate)
+        seen.add(candidate)
+        print(
+            f"[Matroid Progress] Selected {len(history)}/{k} after {attempt} attempts",
+            flush=True,
+        )
+    
+    if len(history) < k:
+        raise RuntimeError(
+            f"Unable to find {k} matroid-constrained matchings – only {len(history)} found."
+        )
+    
+    distance_fn = lambda a, b: weighted_collaboration_distance(base_weights, a, b)
+    min_distance = min_pairwise_distance(history, distance_fn=distance_fn)
+    return history, min_distance
 
 
 def call_matching_oracle(
