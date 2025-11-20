@@ -544,9 +544,107 @@ def load_weighted_graph(resource: Path, *, edges_filename: Optional[str] = None)
     return graph, weights
 
 
+def export_matchings_to_dot(
+    graph: nx.Graph,
+    matchings: List[Matching],
+    weights: EdgeWeightMap,
+    output_path: Path,
+    *,
+    partition: Optional[Dict[Edge, int]] = None,
+    matroid_type: Optional[str] = None,
+) -> None:
+    """
+    Export matchings to DOT format for Graphviz visualization.
+    
+    Args:
+        graph: The input graph
+        matchings: List of matchings to visualize
+        weights: Edge weights
+        output_path: Path to output .dot file
+        partition: Optional partition mapping for partition matroid
+        matroid_type: Type of matroid constraint used
+    """
+    with output_path.open("w") as f:
+        f.write("digraph DiverseMatchings {\n")
+        f.write('  graph [rankdir=LR, splines=true];\n')
+        f.write('  node [shape=circle, style=filled, fillcolor=lightgray];\n\n')
+        
+        # Write matroid info if available
+        if matroid_type:
+            f.write(f'  label="Diverse Matchings with {matroid_type} Constraint";\n')
+            f.write('  labelloc=t;\n')
+            f.write('  fontsize=20;\n\n')
+        
+        # Create a subgraph for each matching
+        for idx, matching in enumerate(matchings, start=1):
+            f.write(f'  subgraph cluster_{idx} {{\n')
+            f.write(f'    label="Matching #{idx} (|M|={len(matching)})";\n')
+            f.write('    style=rounded;\n')
+            f.write('    color=blue;\n')
+            
+            # Get nodes in this matching
+            nodes_in_matching = set()
+            for u, v in matching:
+                nodes_in_matching.add(u)
+                nodes_in_matching.add(v)
+            
+            # Add nodes
+            for node in sorted(nodes_in_matching):
+                f.write(f'    n{idx}_{node} [label="{node}"];\n')
+            
+            # Add edges with weights and partition info
+            for u, v in sorted(matching):
+                edge = (u, v)
+                weight = weights.get(edge, 0.0)
+                
+                # Color based on partition if available
+                color = "black"
+                style = "solid"
+                if partition and edge in partition:
+                    group = partition[edge]
+                    color = "red" if group == 0 else "blue"
+                    style = "bold" if group == 0 else "solid"
+                
+                label = f"{weight:.2f}"
+                if partition and edge in partition:
+                    label += f"\\nG{partition[edge]}"
+                
+                f.write(f'    n{idx}_{u} -> n{idx}_{v} [label="{label}", color={color}, style={style}, dir=none];\n')
+            
+            f.write('  }\n\n')
+        
+        # Add legend if partition matroid
+        if partition and matroid_type == "Partition Matroid":
+            f.write('  subgraph cluster_legend {\n')
+            f.write('    label="Legend";\n')
+            f.write('    style=dashed;\n')
+            f.write('    legend_g0 [label="Group 0\\n(High)", shape=box, color=red, style=filled, fillcolor=pink];\n')
+            f.write('    legend_g1 [label="Group 1\\n(Low)", shape=box, color=blue, style=filled, fillcolor=lightblue];\n')
+            f.write('  }\n')
+        
+        f.write("}\n")
+    
+    print(f"📊 Visualization exported to: {output_path}")
+    print(f"   To view: dot -Tpng {output_path} -o {output_path.with_suffix('.png')}")
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the diverse matching solver on a weighted dataset (CSV folder or edge list).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic diverse matching (Problem 3)
+  python -m src.diverse_matching dataset -k 3 -r 10 --delta 0.3
+  
+  # With uniform matroid constraint (Problem 4)
+  python -m src.diverse_matching dataset -k 3 -r 10 --delta 0.3 --matroid uniform
+  
+  # With partition matroid (Problem 4)
+  python -m src.diverse_matching dataset -k 3 -r 10 --delta 0.3 \\
+    --matroid partition --partition-threshold 15 \\
+    --partition-capacities 3 10 --output matchings.dot
+        """,
     )
     parser.add_argument(
         "dataset",
@@ -567,28 +665,149 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Override the default edges filename inside a dataset directory",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for tie-breaking")
+    
+    # Matroid constraint options
+    matroid_group = parser.add_argument_group("Matroid Constraints (Problem 4)")
+    matroid_group.add_argument(
+        "--matroid",
+        choices=["none", "uniform", "partition", "graphic"],
+        default="none",
+        help="Type of matroid constraint to apply",
+    )
+    matroid_group.add_argument(
+        "--partition-threshold",
+        type=float,
+        help="Weight threshold for partition matroid (edges >= threshold go to group 0)",
+    )
+    matroid_group.add_argument(
+        "--partition-capacities",
+        type=int,
+        nargs=2,
+        metavar=("CAP0", "CAP1"),
+        help="Capacities for partition matroid groups (group 0, group 1)",
+    )
+    
+    # Output options
+    output_group = parser.add_argument_group("Output Options")
+    output_group.add_argument(
+        "--output",
+        type=str,
+        help="Path to output .dot file for visualization (default: no output)",
+    )
+    output_group.add_argument(
+        "--render-png",
+        action="store_true",
+        help="Automatically render DOT file to PNG using Graphviz",
+    )
+    
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    """
+    Entry point. Parses arguments, loads the graph, and runs the diverse matching algorithm.
+    """
     parser = build_argument_parser()
     args = parser.parse_args(argv)
 
+    # Load graph and weights
     graph, base_weights = load_weighted_graph(
         Path(args.dataset),
         edges_filename=args.edges_filename,
     )
-    matchings, min_distance = orchestrate_diverse_matchings(
-        graph,
-        base_weights,
-        k=args.matchings,
-        r=args.max_size,
-        delta=args.delta,
-        max_iterations=args.max_iterations,
-        seed=args.seed,
-    )
+    print(f"Loaded graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges")
+    
+    # Validate parameters
+    if args.matchings < 1:
+        print("Error: Number of matchings must be >= 1")
+        return
+    if args.max_size < 1:
+        print("Error: Maximum matching size must be >= 1")
+        return
+    if args.delta <= 0 or args.delta >= 1:
+        print("Error: Delta must be in range (0, 1)")
+        return
+    
+    # Run appropriate algorithm based on matroid choice
+    partition = None
+    matroid_name = None
+    
+    if args.matroid == "none":
+        print(f"\n🎯 Running Diverse Matching (Problem 3)")
+        print(f"   Parameters: k={args.matchings}, r={args.max_size}, δ={args.delta}")
+        matchings, min_distance = orchestrate_diverse_matchings(
+            graph,
+            base_weights,
+            k=args.matchings,
+            r=args.max_size,
+            delta=args.delta,
+            max_iterations=args.max_iterations,
+            seed=args.seed,
+        )
+        
+    else:
+        # Build matroid oracle based on type
+        matroid_oracle: MatroidOracle
+        
+        if args.matroid == "uniform":
+            print(f"\n🎯 Running Matroid-Constrained Diverse Matching (Problem 4)")
+            print(f"   Matroid: Uniform U({args.max_size}, n)")
+            matroid_oracle = uniform_matroid_oracle(args.max_size)
+            matroid_name = "Uniform Matroid"
+            
+        elif args.matroid == "partition":
+            if args.partition_threshold is None or args.partition_capacities is None:
+                print("Error: --partition-threshold and --partition-capacities required for partition matroid")
+                return
+            
+            # Build partition based on threshold
+            partition = {}
+            for edge in graph.edges():
+                weight = base_weights.get(edge, 0.0)
+                partition[edge] = 0 if weight >= args.partition_threshold else 1
+            
+            capacities_list = args.partition_capacities
+            capacities = {0: capacities_list[0], 1: capacities_list[1]}
+            print(f"\n🎯 Running Matroid-Constrained Diverse Matching (Problem 4)")
+            print(f"   Matroid: Partition Matroid")
+            print(f"   Threshold: {args.partition_threshold}")
+            print(f"   Capacities: Group 0 (≥{args.partition_threshold}) → {capacities[0]}, Group 1 (<{args.partition_threshold}) → {capacities[1]}")
+            
+            # Count edges in each partition
+            count_g0 = sum(1 for g in partition.values() if g == 0)
+            count_g1 = sum(1 for g in partition.values() if g == 1)
+            print(f"   Partition: Group 0 has {count_g0} edges, Group 1 has {count_g1} edges")
+            
+            matroid_oracle = partition_matroid_oracle(partition, capacities)
+            matroid_name = "Partition Matroid"
+            
+        elif args.matroid == "graphic":
+            nodes = set(graph.nodes())
+            print(f"\n🎯 Running Matroid-Constrained Diverse Matching (Problem 4)")
+            print(f"   Matroid: Graphic Matroid on {len(nodes)} nodes")
+            matroid_oracle = graphic_matroid_oracle(nodes)
+            matroid_name = "Graphic Matroid"
+        
+        else:
+            print(f"Error: Unknown matroid type '{args.matroid}'")
+            return
+        
+        print(f"   Parameters: k={args.matchings}, r={args.max_size}, δ={args.delta}")
+        
+        # Run matroid-constrained algorithm
+        matchings, min_distance = diverse_matroid_matching(
+            graph=graph,
+            base_weights=base_weights,
+            matroid_oracle=matroid_oracle,
+            k=args.matchings,
+            r=args.max_size,
+            delta=args.delta,
+            max_iterations=args.max_iterations,
+            seed=args.seed,
+        )
 
-    print(f"Generated {len(matchings)} diverse matchings")
+    # Display results
+    print(f"\n📋 Generated {len(matchings)} diverse matchings")
     for idx, matching in enumerate(matchings, start=1):
         print("-" * 54)
         total_weight = sum(base_weights.get(edge, 0.0) for edge in matching)
@@ -596,6 +815,36 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         for edge in sorted(matching):
             weight = base_weights.get(edge, 0.0)
             print(f"  {edge[0]} -- {edge[1]}  (weight={weight:.2f})")
+    
+    # Export to DOT if requested
+    if args.output:
+        output_path = Path(args.output)
+        export_matchings_to_dot(
+            graph=graph,
+            matchings=matchings,
+            weights=base_weights,
+            output_path=output_path,
+            partition=partition,
+            matroid_type=matroid_name,
+        )
+        
+        # Render to PNG if requested
+        if args.render_png:
+            png_path = output_path.with_suffix('.png')
+            import subprocess
+            try:
+                subprocess.run(
+                    ["dot", "-Tpng", str(output_path), "-o", str(png_path)],
+                    check=True,
+                    capture_output=True,
+                )
+                print(f"🖼️  PNG rendered to: {png_path}")
+            except FileNotFoundError:
+                print("⚠️  Graphviz 'dot' command not found. Install Graphviz to auto-render PNG.")
+            except subprocess.CalledProcessError as e:
+                print(f"⚠️  Error rendering PNG: {e.stderr.decode()}")
+    
+    print("\n✅ Complete!")
 
 
 if __name__ == "__main__":
