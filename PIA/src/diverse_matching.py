@@ -15,6 +15,7 @@ Edge = Tuple[Node, Node]
 Matching = FrozenSet[Edge]
 EdgeWeightMap = Dict[Edge, float]
 MatroidOracle = Callable[[Set[Edge]], bool]
+MaximizationOracle = Callable[[nx.Graph, EdgeWeightMap], FrozenSet[Edge]]
 
 
 def canonical_edge(u: Node, v: Node) -> Edge:
@@ -208,99 +209,49 @@ def matroid_intersection(
     return frozenset(independent_set), total_weight
 
 
-def diverse_matroid_matching(
+def greedy_matroid_maximization(
     graph: nx.Graph,
-    base_weights: EdgeWeightMap,
+    weights: EdgeWeightMap,
     matroid_oracle: MatroidOracle,
-    k: int,
-    r: int,
-    *,
-    delta: float,
-    max_iterations: Optional[int] = None,
-    seed: Optional[int] = None,
-) -> Tuple[List[Matching], float]:
+) -> FrozenSet[Edge]:
     """
-    Generate k diverse matchings subject to an additional matroid constraint.
-    Each matching must satisfy both:
-    1. Be a valid matching (matching matroid)
-    2. Satisfy the given matroid constraint
+    Find maximum weight independent set in a matroid using the Greedy Algorithm.
+    This is optimal for matroids (Rado 1957).
     
     Args:
-        graph: Input graph
-        base_weights: Edge weights
-        matroid_oracle: Additional matroid constraint oracle
-        k: Number of matchings to generate
-        r: Maximum size of each matching
-        delta: Accuracy parameter
-        max_iterations: Optional iteration limit
-        seed: Random seed
+        graph: Input graph (used for edges)
+        weights: Edge weights
+        matroid_oracle: Oracle to check independence
         
     Returns:
-        Tuple of (list of matchings, minimum pairwise distance)
+        Maximum weight independent set (basis)
     """
-    rng = random.Random(seed)
-    history: List[Matching] = []
-    seen: Set[Matching] = set()
+    # Sort all edges by weight descending
+    # Note: We consider all edges in the graph, not just those in weights, 
+    # but usually weights covers relevant edges.
+    all_edges = list(graph.edges())
+    # Canonicalize
+    canonical_edges = [canonical_edge(u, v) for u, v in all_edges]
     
-    eta = min(0.5, delta / 2.0)
-    base_scale = max(2.0, float(len(base_weights)))
-    default_iterations = math.ceil((2.0 * math.log(base_scale)) / (delta ** 2))
-    iterations = max_iterations or (k * default_iterations)
+    # Filter edges that have weights (or assume 0 if not present, but usually we want weighted ones)
+    # The paper implies w: E -> R.
+    sorted_edges = sorted(
+        canonical_edges,
+        key=lambda e: weights.get(e, 0.0),
+        reverse=True
+    )
     
-    for attempt in range(1, iterations + 1):
-        if len(history) >= k:
-            break
-        
-        print(
-            f"[Matroid Progress] Attempt {attempt}/{iterations}: generating candidate...",
-            flush=True,
-        )
-        
-        # Generate candidate matching
-        candidate = find_single_diverse_matching(
-            graph,
-            base_weights,
-            history,
-            max_size=r,
-            iterations=default_iterations,
-            eta=eta,
-            rng=rng,
-        )
-        
-        # Verify matroid constraint
-        if not matroid_oracle(set(candidate)):
-            print(
-                f"[Matroid Progress] Attempt {attempt}: candidate violates matroid constraint",
-                flush=True,
-            )
-            continue
-        
-        if candidate in seen:
-            print(f"[Matroid Progress] Attempt {attempt}: duplicate skipped", flush=True)
-            continue
-        
-        if len(candidate) > r:
-            print(
-                f"[Matroid Progress] Attempt {attempt}: size limit exceeded",
-                flush=True,
-            )
-            continue
-        
-        history.append(candidate)
-        seen.add(candidate)
-        print(
-            f"[Matroid Progress] Selected {len(history)}/{k} after {attempt} attempts",
-            flush=True,
-        )
+    independent_set: Set[Edge] = set()
     
-    if len(history) < k:
-        raise RuntimeError(
-            f"Unable to find {k} matroid-constrained matchings – only {len(history)} found."
-        )
-    
-    distance_fn = lambda a, b: weighted_collaboration_distance(base_weights, a, b)
-    min_distance = min_pairwise_distance(history, distance_fn=distance_fn)
-    return history, min_distance
+    for edge in sorted_edges:
+        candidate = independent_set | {edge}
+        if matroid_oracle(candidate):
+            independent_set.add(edge)
+            
+    return frozenset(independent_set)
+
+
+
 
 
 def call_matching_oracle(
@@ -355,8 +306,8 @@ def find_single_diverse_matching(
     graph: nx.Graph,
     base_weights: EdgeWeightMap,
     history: Sequence[Matching],
+    oracle_fn: MaximizationOracle,
     *,
-    max_size: int,
     iterations: int,
     eta: float,
     rng: Optional[random.Random] = None,
@@ -365,12 +316,7 @@ def find_single_diverse_matching(
         rng = random.Random()
 
     if not history:
-        return call_matching_oracle(
-            graph,
-            base_weights,
-            max_size=max_size,
-            reference_weights=base_weights,
-        )
+        return oracle_fn(graph, base_weights)
 
     dual_weights = [1.0 for _ in history]
     best_matching: Optional[Matching] = None
@@ -383,12 +329,7 @@ def find_single_diverse_matching(
             jitter = 1.0 + 0.01 * rng.uniform(-1.0, 1.0)
             jittered_weights[edge] = max(weight * jitter, 0.0)
 
-        candidate = call_matching_oracle(
-            graph,
-            jittered_weights,
-            max_size=max_size,
-            reference_weights=base_weights,
-        )
+        candidate = oracle_fn(graph, jittered_weights)
         if not candidate:
             continue
 
@@ -414,12 +355,7 @@ def find_single_diverse_matching(
             dual_weights = [dw * scale for dw in dual_weights]
 
     if best_matching is None:
-        return call_matching_oracle(
-            graph,
-            base_weights,
-            max_size=max_size,
-            reference_weights=base_weights,
-        )
+        return oracle_fn(graph, base_weights)
 
     return best_matching
 
@@ -427,8 +363,8 @@ def find_single_diverse_matching(
 def orchestrate_diverse_matchings(
     graph: nx.Graph,
     base_weights: EdgeWeightMap,
+    oracle_fn: MaximizationOracle,
     k: int,
-    r: int,
     *,
     delta: float,
     max_iterations: Optional[int] = None,
@@ -436,8 +372,6 @@ def orchestrate_diverse_matchings(
 ) -> Tuple[List[Matching], float]:
     if k <= 0:
         raise ValueError("k must be positive")
-    if r <= 0:
-        raise ValueError("r must be positive")
     if delta <= 0:
         raise ValueError("delta must be positive")
 
@@ -463,7 +397,7 @@ def orchestrate_diverse_matchings(
             graph,
             base_weights,
             history,
-            max_size=r,
+            oracle_fn=oracle_fn,
             iterations=default_iterations,
             eta=eta,
             rng=rng,
@@ -471,12 +405,6 @@ def orchestrate_diverse_matchings(
 
         if candidate in seen:
             print(f"[Progress] Attempt {attempt}/{iterations}: duplicate matching skipped", flush=True)
-            continue
-        if len(candidate) > r:
-            print(
-                f"[Progress] Attempt {attempt}/{iterations}: candidate exceeded size limit (|M|={len(candidate)} > r={r})",
-                flush=True,
-            )
             continue
 
         history.append(candidate)
@@ -731,26 +659,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     # Run appropriate algorithm based on matroid choice
     partition = None
     matroid_name = None
+    oracle_fn: MaximizationOracle
     
     if args.matroid == "none":
-        print(f"\n🎯 Running Diverse Matching (Problem 3)")
+        print(f"\\n🎯 Running Diverse Matching (Problem 3)")
         print(f"   Parameters: k={args.matchings}, r={args.max_size}, δ={args.delta}")
-        matchings, min_distance = orchestrate_diverse_matchings(
-            graph,
-            base_weights,
-            k=args.matchings,
-            r=args.max_size,
-            delta=args.delta,
-            max_iterations=args.max_iterations,
-            seed=args.seed,
-        )
+        
+        # Define the Matching Oracle (Problem 3)
+        def matching_oracle_wrapper(g: nx.Graph, w: EdgeWeightMap) -> FrozenSet[Edge]:
+            return call_matching_oracle(g, w, max_size=args.max_size, reference_weights=base_weights)
+            
+        oracle_fn = matching_oracle_wrapper
         
     else:
         # Build matroid oracle based on type
         matroid_oracle: MatroidOracle
         
         if args.matroid == "uniform":
-            print(f"\n🎯 Running Matroid-Constrained Diverse Matching (Problem 4)")
+            print(f"\\n🎯 Running Diverse Matroid Bases (Problem 4)")
             print(f"   Matroid: Uniform U({args.max_size}, n)")
             matroid_oracle = uniform_matroid_oracle(args.max_size)
             matroid_name = "Uniform Matroid"
@@ -768,7 +694,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             
             capacities_list = args.partition_capacities
             capacities = {0: capacities_list[0], 1: capacities_list[1]}
-            print(f"\n🎯 Running Matroid-Constrained Diverse Matching (Problem 4)")
+            print(f"\\n🎯 Running Diverse Matroid Bases (Problem 4)")
             print(f"   Matroid: Partition Matroid")
             print(f"   Threshold: {args.partition_threshold}")
             print(f"   Capacities: Group 0 (≥{args.partition_threshold}) → {capacities[0]}, Group 1 (<{args.partition_threshold}) → {capacities[1]}")
@@ -783,7 +709,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             
         elif args.matroid == "graphic":
             nodes = set(graph.nodes())
-            print(f"\n🎯 Running Matroid-Constrained Diverse Matching (Problem 4)")
+            print(f"\\n🎯 Running Diverse Matroid Bases (Problem 4)")
             print(f"   Matroid: Graphic Matroid on {len(nodes)} nodes")
             matroid_oracle = graphic_matroid_oracle(nodes)
             matroid_name = "Graphic Matroid"
@@ -792,19 +718,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             print(f"Error: Unknown matroid type '{args.matroid}'")
             return
         
-        print(f"   Parameters: k={args.matchings}, r={args.max_size}, δ={args.delta}")
+        # Define the Greedy Matroid Oracle (Problem 4)
+        def matroid_oracle_wrapper(g: nx.Graph, w: EdgeWeightMap) -> FrozenSet[Edge]:
+            return greedy_matroid_maximization(g, w, matroid_oracle)
+            
+        oracle_fn = matroid_oracle_wrapper
         
-        # Run matroid-constrained algorithm
-        matchings, min_distance = diverse_matroid_matching(
-            graph=graph,
-            base_weights=base_weights,
-            matroid_oracle=matroid_oracle,
-            k=args.matchings,
-            r=args.max_size,
-            delta=args.delta,
-            max_iterations=args.max_iterations,
-            seed=args.seed,
-        )
+    print(f"   Parameters: k={args.matchings}, δ={args.delta}")
+    
+    # Run generic diverse solution algorithm
+    matchings, min_distance = orchestrate_diverse_matchings(
+        graph,
+        base_weights,
+        oracle_fn=oracle_fn,
+        k=args.matchings,
+        delta=args.delta,
+        max_iterations=args.max_iterations,
+        seed=args.seed,
+    )
 
     # Display results
     print(f"\n📋 Generated {len(matchings)} diverse matchings")

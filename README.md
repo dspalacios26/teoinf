@@ -57,103 +57,53 @@ python -m src.diverse_matching astro-ph-1999 -k 10 -r 20 --delta 0.2 --seed 7
 
 You can pass either a dataset folder (with an `edges.csv` file) or a single plain-text edge list. In both cases the loader expects each line to look like `u v weight`, ignoring blank lines and lines starting with `#`. Use `--edges-filename` if your folder stores edges under a different name. While running, the orchestrator prints `[Progress]` messages so you can see how many attempts were needed to lock in each matching. The final summary now lists each matching's size and total weighted distance, omitting the aggregate minimum distance.
 
-## Matroid-Constrained Diverse Matching (Problem 4)
+## Diverse Matroid Bases (Problem 4)
 
-The CLI now supports matroid constraints, allowing you to generate diverse matchings that satisfy additional structural requirements beyond simple matching constraints.
+The CLI now supports finding diverse bases of a matroid, as described in Problem 4 of the paper. This is distinct from Problem 3 (Diverse Matching). When a matroid is selected, the tool finds diverse **bases** (independent sets) of that matroid, which may or may not be matchings.
 
 ### Available Matroid Types
 
 #### 1. **No Matroid** (Default - Problem 3)
-Standard diverse matching without additional constraints.
-
+Runs the standard **Diverse Matching** algorithm.
 ```bash
 python -m src.diverse_matching dataset -k 3 -r 10 --delta 0.3
 ```
-
-**Graph Requirements:** Any weighted graph  
-**Use Case:** Basic diverse matching scenario
+**Output:** Diverse Matchings (sets of edges where no two share a node).
 
 #### 2. **Uniform Matroid** (`--matroid uniform`)
-Constrains each matching to have at most `r` edges (automatically enforced by the `r` parameter).
-
+Finds diverse sets of `r` edges (Problem 4).
 ```bash
 python -m src.diverse_matching dataset -k 3 -r 10 --delta 0.3 --matroid uniform
 ```
-
-**Parameters:**
-- Standard parameters only (`-k`, `-r`, `--delta`)
-
-**Graph Requirements:** Any weighted graph  
-**Use Case:** When you want explicit uniform matroid constraints in addition to matching constraints
-
-**Mathematical Definition:** U(r, n) - independent sets are subsets of size ≤ r
+**Output:** Diverse sets of size `r` (specifically, the top `r` weighted edges, subject to diversity penalties).
+**Note:** These sets are NOT constrained to be matchings.
 
 #### 3. **Partition Matroid** (`--matroid partition`)
-Partitions edges into groups based on weight threshold, with capacity limits per group.
-
+Finds diverse bases respecting partition capacities.
 ```bash
 python -m src.diverse_matching dataset -k 3 -r 15 --delta 0.3 \
   --matroid partition \
   --partition-threshold 15.0 \
   --partition-capacities 5 10
 ```
-
-**Parameters:**
-- `--partition-threshold <float>`: Weight value that divides edges into two groups
-  - Group 0: edges with weight ≥ threshold (typically "high-value" collaborations)
-  - Group 1: edges with weight < threshold (typically "low-value" collaborations)
-- `--partition-capacities <cap0> <cap1>`: Maximum number of edges allowed from each group
-  - First value: capacity for Group 0 (high-weight edges)
-  - Second value: capacity for Group 1 (low-weight edges)
-
-**Graph Requirements:**
-- **Varied weights:** Graph must have both high and low-weight edges relative to the threshold
-- **Sufficient capacity:** Sum of capacities must be ≥ r to ensure feasible matchings
-- **Balanced distribution:** Ideally, bimodal weight distribution (e.g., ~50% high, ~50% low weights)
-
-**Recommended Graph:** Generate with bimodal distribution:
-```bash
-python generate_graph.py --nodes 50 --edges 150 --type random \
-  --weight-dist bimodal --output test_graph_partition
-```
-
-**Use Case:** Balance between high-value and low-value collaborations, prevent matchings from being dominated by one type of edge
-
-**Mathematical Definition:** Partition matroid M = (E, I) where edges are partitioned into groups {G₀, G₁}, and a set S is independent iff |S ∩ Gᵢ| ≤ capacityᵢ for all i
-
-**Example Output:**
-```
-🎯 Running Matroid-Constrained Diverse Matching (Problem 4)
-   Matroid: Partition Matroid
-   Threshold: 15.0
-   Capacities: Group 0 (≥15.0) → 5, Group 1 (<15.0) → 10
-   Partition: Group 0 has 76 edges, Group 1 has 724 edges
-```
+**Output:** Diverse sets of edges satisfying the group capacities.
 
 #### 4. **Graphic Matroid** (`--matroid graphic`)
-Constrains each matching to form a forest (acyclic subgraph).
-
+Finds diverse **Spanning Forests** (Problem 4).
 ```bash
 python -m src.diverse_matching dataset -k 3 -r 10 --delta 0.3 --matroid graphic
 ```
+**Output:** Diverse Spanning Forests (acyclic sets of edges).
+**Note:** A spanning forest is rarely a matching. This correctly implements Problem 4 (Diverse Matroid Bases) rather than "Matchings that are Forests".
 
-**Parameters:**
-- Standard parameters only (`-k`, `-r`, `--delta`)
+### Matroid Selection Guide
 
-**Graph Requirements:**
-- **General graphs:** Works on any graph structure
-- **Sparse graphs preferred:** Dense graphs may make finding acyclic matchings difficult
-- **Tree-like structure:** Graphs with natural tree/forest structure work best
-
-**Recommended Graph:** Generate with tree or grid structure:
-```bash
-python generate_graph.py --nodes 50 --edges 100 --type grid \
-  --weight-dist normal --output test_graph_graphic
-```
-
-**Use Case:** When matchings must avoid cycles, useful for hierarchical collaboration structures
-
-**Mathematical Definition:** Graphic matroid M = (E, I) where a set of edges S is independent iff S forms a forest (contains no cycles)
+| Matroid | Problem | Output Structure | Use Case |
+|---------|---------|------------------|----------|
+| **none** | Problem 3 | **Matching** | Standard diverse collaboration matching |
+| **uniform** | Problem 4 | **Set of size r** | Selecting top-k diverse edge sets |
+| **partition** | Problem 4 | **Partitioned Set** | Balanced diverse edge selection |
+| **graphic** | Problem 4 | **Spanning Forest** | Diverse network backbones (acyclic) |
 
 ### Visualization Output
 
@@ -174,7 +124,7 @@ python -m src.diverse_matching dataset -k 3 -r 10 --delta 0.3 \
 ```
 
 **DOT File Features:**
-- Separate subgraph clusters for each matching
+- Separate subgraph clusters for each solution (matching or basis)
 - Edge weights labeled on all edges
 - For partition matroid: color-coded edges (red = Group 0, blue = Group 1)
 - Legend explaining the visualization
@@ -191,8 +141,8 @@ dot -Tpdf matchings.dot -o matchings.pdf
 
 **Required Arguments:**
 - `dataset`: Path to dataset folder (with edges.csv) or edge list file
-- `-k, --matchings`: Number of diverse matchings to generate
-- `-r, --max-size`: Maximum edges per matching
+- `-k, --matchings`: Number of diverse solutions (matchings or bases) to generate
+- `-r, --max-size`: Maximum edges per solution (for Problem 3) or size of basis (for Uniform Matroid)
 - `--delta`: MWU accuracy parameter (0 < δ < 1)
 
 **Optional Arguments:**
@@ -211,11 +161,11 @@ dot -Tpdf matchings.dot -o matchings.pdf
 
 ### Example Workflows
 
-**Example 1: Uniform Matroid with Visualization**
+**Example 1: Uniform Matroid (Problem 4)**
 ```bash
 python -m src.diverse_matching smallw -k 3 -r 10 --delta 0.3 \
   --matroid uniform \
-  --output uniform_matchings.dot \
+  --output uniform_bases.dot \
   --render-png \
   --seed 42
 ```
@@ -230,22 +180,13 @@ python -m src.diverse_matching hep-th-1999 -k 3 -r 15 --delta 0.3 \
   --seed 42
 ```
 
-**Example 3: Graphic Matroid (Forest Constraint)**
+**Example 3: Graphic Matroid (Spanning Forest)**
 ```bash
 python -m src.diverse_matching dataset -k 3 -r 10 --delta 0.3 \
   --matroid graphic \
-  --output forest_matchings.dot \
+  --output forest_bases.dot \
   --render-png
 ```
-
-### Matroid Selection Guide
-
-| Matroid | Constraint | Best Graph Type | Use Case |
-|---------|-----------|-----------------|----------|
-| **none** | Matching only | Any graph | Basic diverse matching |
-| **uniform** | Size limit ≤ r | Any graph | Explicit size constraints |
-| **partition** | Group capacities | Bimodal weights | Balance high/low-value edges |
-| **graphic** | Acyclic (forest) | Sparse/tree-like | Hierarchical structures |
 
 ### Troubleshooting
 
